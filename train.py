@@ -9,6 +9,22 @@ from tensorflow.keras.utils import Sequence
 from sklearn.model_selection import train_test_split
 
 # ===============================
+# TPU Initialization
+# ===============================
+try:
+    # Detect TPU
+    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # automatically detects TPU in Cloud TPU VM
+    print("TPU detected:", tpu.cluster_spec().as_dict())
+    tf.config.experimental_connect_to_cluster(tpu)
+    tf.tpu.experimental.initialize_tpu_system(tpu)
+    strategy = tf.distribute.TPUStrategy(tpu)
+    print("Running on TPU with", strategy.num_replicas_in_sync, "accelerators.")
+except Exception as e:
+    print("TPU not detected or initialization failed; falling back to default strategy. Error:", e)
+    strategy = tf.distribute.get_strategy()
+    print("Running on", strategy.num_replicas_in_sync, "accelerators.")
+
+# ===============================
 # Data Loader and Generator
 # ===============================
 
@@ -83,7 +99,7 @@ class VideoDataGenerator(Sequence):
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # In case the video has fewer frames than desired, we repeat the last frame.
+        # If video has fewer frames than desired, repeat the last frame.
         if total_frames < self.num_frames:
             frame_indices = np.concatenate([np.arange(total_frames),
                                             np.full((self.num_frames - total_frames,), total_frames - 1)])
@@ -95,13 +111,10 @@ class VideoDataGenerator(Sequence):
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if not ret:
-                # If a frame is not read successfully, use a black frame.
+                # If frame reading fails, use a black frame.
                 frame = np.zeros((self.target_size[1], self.target_size[0], 3), dtype=np.uint8)
-            # Resize frame
             frame = cv2.resize(frame, self.target_size)
-            # Convert BGR to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Normalize to [0,1]
             frame = frame.astype(np.float32) / 255.0
             frames.append(frame)
         cap.release()
@@ -110,27 +123,26 @@ class VideoDataGenerator(Sequence):
 # ===============================
 # Model Definition
 # ===============================
-
 def build_model(num_frames=16, target_size=(224, 224)):
     """
     Builds a video classification model using a TimeDistributed EfficientNetB0 backbone
-    and an LSTM for temporal aggregation. A dropout layer is added for regularization.
+    and an LSTM for temporal aggregation. Dropout is added for regularization.
     """
     input_shape = (num_frames, target_size[1], target_size[0], 3)  # (frames, height, width, channels)
     inputs = layers.Input(shape=input_shape)
 
-    # Pretrained CNN (EfficientNetB0) applied to each frame.
+    # Pretrained CNN applied to each frame
     cnn_base = EfficientNetB0(include_top=False, weights='imagenet', pooling='avg')
-    cnn_base.trainable = False  # freeze for transfer learning
+    cnn_base.trainable = False  # Freeze the backbone for transfer learning
     x = layers.TimeDistributed(cnn_base)(inputs)
 
-    # Optional: You could add a spatial attention block here if desired.
+    # Optional: Insert spatial attention modules here if needed
 
-    # Temporal aggregation using an LSTM.
+    # Temporal aggregation using LSTM
     x = layers.LSTM(64, return_sequences=False)(x)
     x = layers.Dropout(0.5)(x)
 
-    # Final dense layer with sigmoid activation for binary classification.
+    # Final classification layer
     outputs = layers.Dense(1, activation='sigmoid')(x)
 
     model = models.Model(inputs, outputs)
@@ -141,41 +153,44 @@ def build_model(num_frames=16, target_size=(224, 224)):
     return model
 
 # ===============================
-# Main Training and Testing Pipeline
+# Main Training Pipeline
 # ===============================
-
 if __name__ == '__main__':
     # Load dataset
     video_paths, labels = load_dataset()
     print(f"Total videos found: {len(video_paths)}")
 
-    # Split into train, validation, and test sets (70/15/15 split)
-    train_paths, temp_paths, train_labels, temp_labels = train_test_split(video_paths, labels, test_size=0.3, random_state=42, stratify=labels)
-    val_paths, test_paths, val_labels, test_labels = train_test_split(temp_paths, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels)
+    # Split dataset: 70% train, 15% validation, 15% test
+    train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+        video_paths, labels, test_size=0.3, random_state=42, stratify=labels)
+    val_paths, test_paths, val_labels, test_labels = train_test_split(
+        temp_paths, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels)
 
     print(f"Training videos: {len(train_paths)}")
     print(f"Validation videos: {len(val_paths)}")
     print(f"Testing videos: {len(test_paths)}")
 
-    # Parameters
+    # Set parameters
     batch_size = 4
     num_frames = 16
     target_size = (224, 224)
     epochs = 50
 
-    # Generators
+    # Create generators
     train_generator = VideoDataGenerator(train_paths, train_labels, batch_size=batch_size, num_frames=num_frames, target_size=target_size, shuffle=True)
     val_generator = VideoDataGenerator(val_paths, val_labels, batch_size=batch_size, num_frames=num_frames, target_size=target_size, shuffle=False)
     test_generator = VideoDataGenerator(test_paths, test_labels, batch_size=batch_size, num_frames=num_frames, target_size=target_size, shuffle=False)
 
-    # Build the model
-    model = build_model(num_frames=num_frames, target_size=target_size)
+    # Build and compile the model within the TPU strategy scope
+    with strategy.scope():
+        model = build_model(num_frames=num_frames, target_size=target_size)
+
     model.summary()
 
-    # Callbacks for early stopping and best model checkpointing
+    # Set up callbacks: EarlyStopping and ModelCheckpoint
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-        ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True)
+        ModelCheckpoint('best_model_tpu.h5', monitor='val_loss', save_best_only=True)
     ]
 
     # Train the model
@@ -191,13 +206,5 @@ if __name__ == '__main__':
     test_loss, test_accuracy = model.evaluate(test_generator, verbose=1)
     print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
 
-    # Optionally: Save the final model
-    model.save('final_video_classifier.h5')
-
-    # Example: Make a prediction on one test video and output the confidence level.
-    import matplotlib.pyplot as plt
-
-    sample_video, sample_label = test_generator[0]  # get first batch
-    pred = model.predict(sample_video)
-    for i, confidence in enumerate(pred):
-        print(f"Video {i}: Predicted confidence (sludge probability): {confidence[0]:.4f}")
+    # Save the final model
+    model.save('final_video_classifier_tpu.h5')
